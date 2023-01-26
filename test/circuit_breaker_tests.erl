@@ -47,6 +47,8 @@ circuit_breaker_test_() ->
      , fun ignore_errors/1
      , fun info/1
      , fun info_to_text/1
+     , fun info_format_proplist/1
+     , fun info_format_map/1
      ]}}.
 
 start() ->
@@ -170,6 +172,35 @@ info_to_text(_Setup) ->
     , "------------------------------- --------------- -------- -------- --------\n"
     , "service                         OK              0        0        0       \n"
     >>,
+  [ ?_assertEqual(Expected, Result)
+  ].
+
+info_format_proplist(_Setup) ->
+  call(),
+  Result = circuit_breaker:info([{format, proplist}]),
+  Expected =
+    [ [{service,service}
+      , {flags,0}
+      , {n_timeout,0}
+      , {n_call_timeout,0}
+      , {n_error,0}
+      ]
+    ],
+  [ ?_assertEqual(Expected, Result)
+  ].
+
+info_format_map(_Setup) ->
+  call(),
+  Result = circuit_breaker:info([{format, map}]),
+  Expected =
+    [ #{service => service
+      , flags => 0
+      , flags_info => [ok]
+      , n_timeout => 0
+      , n_call_timeout => 0
+      , n_error => 0
+      }
+    ],
   [ ?_assertEqual(Expected, Result)
   ].
 

@@ -59,6 +59,7 @@
         , disabled/1
         , blocked/1
         , info/0
+        , info/1
         , info_to_text/0
         ]).
 
@@ -227,6 +228,17 @@ info_to_text() ->
   Entries = ets:foldl(fun do_info/2, [], ?TABLE),
   [Header, Split, Entries].
 
+-spec info(Opts::proplists:proplist()) -> proplists:proplist().
+%% @doc Return information regarding services.
+%% @end
+info(Opts) ->
+  Fold = case proplists:get_value(format, Opts, map) of
+           proplist -> fun(R, Acc) -> [to_proplist(R) | Acc] end;
+           map -> fun(R, Acc) -> [to_map(R) | Acc] end
+         end,
+  ets:foldl(Fold, [], ?TABLE).
+
+
 %%%_* Gen server callbacks =============================================
 %% @hidden
 init([]) ->
@@ -376,6 +388,23 @@ pif(?CIRCUIT_BREAKER_BLOCKED)      -> "BLOCKED";
 pif(?CIRCUIT_BREAKER_CALL_TIMEOUT) -> "CALL TIMEOUT";
 pif(?CIRCUIT_BREAKER_TIMEOUT)      -> "TIMEOUT";
 pif(?CIRCUIT_BREAKER_ERROR)        -> "ERROR".
+
+atom_flags(0) -> [pia(?CIRCUIT_BREAKER_OK)];
+atom_flags(F) -> atom_flags(0, F, []).
+
+atom_flags(Pos, Flags, Acc) when Flags < (1 bsl Pos) ->
+  lists:reverse(Acc);
+atom_flags(Pos, Flags, Acc) when ?bit_is_set(Flags, (1 bsl Pos)) ->
+  atom_flags(Pos + 1, Flags, [pia(1 bsl Pos)|Acc]);
+atom_flags(Pos, Flags, Acc) ->
+  atom_flags(Pos + 1, Flags, Acc).
+
+pia(?CIRCUIT_BREAKER_OK)           -> ok;
+pia(?CIRCUIT_BREAKER_WARNING)      -> warning;
+pia(?CIRCUIT_BREAKER_BLOCKED)      -> blocked;
+pia(?CIRCUIT_BREAKER_CALL_TIMEOUT) -> call_timeout;
+pia(?CIRCUIT_BREAKER_TIMEOUT)      -> timeout;
+pia(?CIRCUIT_BREAKER_ERROR)        -> error.
 
 dup(N, Char) -> lists:duplicate(N, Char).
 
@@ -595,6 +624,20 @@ to_proplist(#circuit_breaker{ service      = Service
   , {n_call_timeout, NCallTimeout}
   , {n_error, NError}
   ].
+
+to_map(#circuit_breaker{ service      = Service
+                                , flags        = Flags
+                                , timeout      = NTimeout
+                                , call_timeout = NCallTimeout
+                                , error        = NError
+                                }) ->
+  #{ service => Service
+   , flags => Flags
+   , flags_info => atom_flags(Flags)
+   , n_timeout => NTimeout
+   , n_call_timeout => NCallTimeout
+   , n_error => NError
+   }.
 
 %%%_* Emacs ============================================================
 %%% Local Variables:
