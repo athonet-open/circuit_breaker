@@ -104,6 +104,7 @@
 -define(CALL_TIMEOUT,      10 * 1000).      % 10 seconds
 -define(RESET_TIMEOUT,     10 * 60 * 1000). % 10 minutes
 -define(RESET_FUN,         fun() -> true end).
+-define(BLOCK_FUN,         fun() -> true end).
 -define(N_ERROR,           10).
 -define(N_TIMEOUT,         10).
 -define(N_CALL_TIMEOUT,    10).
@@ -134,6 +135,7 @@
 -type event_info() :: proplists:proplist() | #circuit_breaker{}.
 
 -type call_opts() :: #{ call_timeout => non_neg_integer(),
+                        block_fun => fun(() -> any()),
                         reset_fun => fun(() -> any()),
                         reset_timeout => non_neg_integer(),
                         thresholds => list(thresholds_opt())
@@ -506,11 +508,13 @@ fault_status(R0, _Service, Type, Opts) ->
       event(automatically_blocked, R0, [{error, Type}]),
       ResetTimeout = maps:get(reset_timeout, Opts, ?RESET_TIMEOUT),
       ResetFun = maps:get(reset_fun, Opts, ?RESET_FUN),
+      BlockFun = maps:get(block_fun, Opts, ?BLOCK_FUN),
       Flag  = flag(Type),
       R1    = maybe_cancel_timer(R0),
       R2    = set_data(R1, Type, {N + 1, Now}),
       R     = start_timer(R2, ResetTimeout),
       Flags = ?bit_clr(R#circuit_breaker.flags, ?CIRCUIT_BREAKER_WARNING),
+      try BlockFun() catch _ -> ok end,
       write(R#circuit_breaker{ flags     = ?bit_set(Flags, Flag)
                              , reset_fun = ResetFun
                              });
