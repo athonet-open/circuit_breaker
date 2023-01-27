@@ -47,10 +47,15 @@
 %%%_* Behaviour ========================================================
 -behaviour(gen_server).
 
+%%%_* Compile ==========================================================
+
+-compile({no_auto_import,[error/3]}).
+
 %%%_* Exports ==========================================================
 %% API
 -export([ start_link/0
         , call/2
+        , call/3
         , call/5
         , call/6
         , clear/1
@@ -128,8 +133,24 @@
 
 -type event_info() :: proplists:proplist() | #circuit_breaker{}.
 
+-type call_opts() :: #{ call_timeout => non_neg_integer(),
+                        reset_fun => fun(() -> any()),
+                        reset_timeout => non_neg_integer(),
+                        thresholds => list(thresholds_opt())
+                      }.
+
+-type thresholds_opt() :: {n_error,           non_neg_integer()}
+                        | {n_timeout,         non_neg_integer()}
+                        | {n_call_timeout,    non_neg_integer()}
+                        | {time_error,        non_neg_integer()}
+                        | {time_timeout,      non_neg_integer()}
+                        | {time_call_timeout, non_neg_integer() | infinity}
+                        | {ignore_errors,     list(atom())}.
+
 -export_type([ event_type/0
              , event_info/0
+             , call_opts/0
+             , thresholds_opt/0
              ]).
 
 %%%_* API ==============================================================
@@ -142,19 +163,34 @@ start_link() -> gen_server:start_link({local, ?SERVER}, ?SERVER, [], []).
 %% @doc Call Service with default parameters.
 %% @end
 call(Service, CallFun) ->
-  call(Service, CallFun, ?CALL_TIMEOUT, ?RESET_FUN, ?RESET_TIMEOUT).
+  call(Service, CallFun, #{}).
+
 
 -spec call(Service::term(), CallFun::function(),
-           CallTimeout::integer(), ResetFun::function(),
-           ResetTimeout::integer()) -> term().
+           Opts::call_opts()) -> term().
+%% @doc Call Service with default parameters.
+%% @end
+call(Service, CallFun, Opts) when is_map(Opts) ->
+  case read(Service) of
+    R when (R#circuit_breaker.flags > ?CIRCUIT_BREAKER_WARNING) ->
+      event(?call_dropped, R),
+      {error, {circuit_breaker, R#circuit_breaker.flags}};
+    _ -> do_call(Service, CallFun, Opts)
+  end.
+
+-spec call(Service::term(), CallFun::function(),
+           CallTimeout::non_neg_integer(), ResetFun::fun(() -> any()),
+           ResetTimeout::non_neg_integer()) -> term().
 %% @doc Call Service with custom parameters.
 %% @end
 call(Service, CallFun, CallTimeout, ResetFun, ResetTimeout) ->
-  call(Service, CallFun, CallTimeout, ResetFun, ResetTimeout, ?THRESHOLDS).
+  call(Service, CallFun, #{call_timeout => CallTimeout,
+                           reset_fun => ResetFun,
+                           reset_timeout => ResetTimeout}).
 
 -spec call(Service::term(), CallFun::function(),
-           CallTimeout::integer(), ResetFun::function(),
-           ResetTimeout::integer(), Thresholds::list()) -> term().
+           CallTimeout::non_neg_integer(), ResetFun::function(),
+           ResetTimeout::non_neg_integer(), Thresholds::list()) -> term().
 %% @doc Call Service with custom parameters.
 %% @end
 call(Service, CallFun, CallTimeout, ResetFun, ResetTimeout, Thresholds) ->
@@ -162,8 +198,10 @@ call(Service, CallFun, CallTimeout, ResetFun, ResetTimeout, Thresholds) ->
     R when (R#circuit_breaker.flags > ?CIRCUIT_BREAKER_WARNING) ->
       event(?call_dropped, R),
       {error, {circuit_breaker, R#circuit_breaker.flags}};
-    _ -> do_call(Service, CallFun, CallTimeout, ResetFun,
-                 ResetTimeout, Thresholds)
+    _ -> do_call(Service, CallFun, #{call_timeout => CallTimeout,
+                                     reset_fun => ResetFun,
+                                     reset_timeout => ResetTimeout,
+                                     thresholds => Thresholds })
   end.
 
 -spec block(Service::term()) -> ok | {error, undefined}.
@@ -272,26 +310,25 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 
 %%%_* Internal =========================================================
 
--dialyzer({no_fail_call, do_call/6}).
+-dialyzer({no_fail_call, do_call/3}).
 
-do_call(Service, CallFun, CallTimeout, ResetFun, ResetTimeout, Thresholds) ->
+do_call(Service, CallFun, Opts) ->
   Self   = self(),
   Pid    = proc_lib:spawn(fun() -> called(Self, preserve_exception(CallFun, Service), Service) end),
   MonRef = erlang:monitor(process, Pid),
+  CallTimeout = maps:get(call_timeout, Opts, ?CALL_TIMEOUT),
   receive
     {Pid, Result, Service} ->
       erlang:demonitor(MonRef, [flush]),
-      handle_result({got, Result}, Service, ResetFun, ResetTimeout, Thresholds);
+      handle_result({got, Result}, Service, Opts);
     {'DOWN', MonRef, process, Pid, Reason} ->
-      handle_result({'EXIT', Reason}, Service, ResetFun,
-                    ResetTimeout, Thresholds)
+      handle_result({'EXIT', Reason}, Service, Opts)
   after CallTimeout ->
       %% Let CallFun/0 continue in order to finish work,
       %% but return to client now.
       Pid ! {Self, call_timeout},
       erlang:demonitor(MonRef, [flush]),
-      handle_result({error, call_timeout, Pid}, Service, ResetFun,
-                    ResetTimeout, Thresholds)
+      handle_result({error, call_timeout, Pid}, Service, Opts)
   end.
 
 preserve_exception(CallFun, Service) ->
@@ -313,40 +350,39 @@ called(Parent, Result, Service) ->
   after 0 -> Parent ! {self(), Result, Service}
   end.
 
-handle_result({got, Result}, Service, ResetFun, ResetTimeout, Thresholds) ->
+handle_result({got, Result}, Service, Opts) ->
   case Result of
     {error, timeout}                         ->
-      timeout(Service, ResetFun, ResetTimeout, Thresholds);
+      timeout(Service, Opts);
     Result when element(1, Result) =:= error ->
-      error(Service, Result, ResetFun, ResetTimeout, Thresholds);
+      error(Service, Result, Opts);
     _ -> ok(Service)
   end,
   Result;
-handle_result({error, call_timeout, Pid}, Service, ResetFun,
-              ResetTimeout, Thresholds) ->
-  call_timeout(Pid, Service, ResetFun, ResetTimeout, Thresholds),
+handle_result({error, call_timeout, Pid}, Service, Opts) ->
+  call_timeout(Pid, Service, Opts),
   {error, timeout};
-handle_result({'EXIT', {raise, Class, Reason, Stacktrace}}, Service, ResetFun,
-              ResetTimeout, Thresholds) ->
-  error(Service, {'EXIT', Reason}, ResetFun, ResetTimeout, Thresholds),
+handle_result({'EXIT', {raise, Class, Reason, Stacktrace}}, Service, Opts) ->
+  error(Service, {'EXIT', Reason}, Opts),
   %% Keep behavior as if CallFun/0 was executed in same process context.
   erlang:raise(Class, Reason, Stacktrace).
 
-error(Service, {_, Reason} = Error, ResetFun, ResetTimeout, Thresholds) ->
+error(Service, {_, Reason} = Error, Opts) ->
+  Thresholds = maps:get(thresholds, Opts, ?THRESHOLDS),
   case lists:member(Reason, ignore_errors(Thresholds)) of
     true  -> ok(Service);
     false ->
       event(error, Service, [{error, Error}]),
-      change_status(Service, {error, ResetFun, ResetTimeout, Thresholds})
+      change_status(Service, {error, Opts})
   end.
 
-call_timeout(Pid, Service, ResetFun, ResetTimeout, Thresholds) ->
+call_timeout(Pid, Service, Opts) ->
   event(call_timeout, Service, [{error, {call_timeout, Pid}}]),
-  change_status(Service, {call_timeout, ResetFun, ResetTimeout, Thresholds}).
+  change_status(Service, {call_timeout, Opts}).
 
-timeout(Service, ResetFun, ResetTimeout, Thresholds) ->
+timeout(Service, Opts) ->
   event(timeout, Service, [{error, timeout}]),
-  change_status(Service, {timeout, ResetFun, ResetTimeout, Thresholds}).
+  change_status(Service, {timeout, Opts}).
 
 ok(Service) ->
   case try_read(Service) of
@@ -420,15 +456,15 @@ do_init(Service) ->
 do_change_status(Service, What) ->
   do_change_status(read(Service), Service, What).
 
-%% What = {error, ResetFun, ResetTimeout, Thresholds} |
-%%        {call_timeout, ResetFun, ResetTimeout, Thresholds} |
-%%        {timeout, ResetFun, ResetTimeout, Thresholds} |
+%% What = {error, Opts::proplists:proplist()} |
+%%        {call_timeout, Opts::proplists:proplist()} |
+%%        {timeout, Opts::proplists:proplist()} |
 %%        ok |
 %%        block |
 %%        deblock |
 %%        clear
-do_change_status(R, Service, {Type, ResetFun, ResetTimeout, Thresholds}) ->
-  fault_status(R, Service, Type, ResetFun, ResetTimeout, Thresholds);
+do_change_status(R, Service, {Type, Opts}) ->
+  fault_status(R, Service, Type, Opts);
 do_change_status(R, _Service, ok) ->
   decrease_counter(R);
 do_change_status(R0, _Service, block) ->
@@ -458,7 +494,8 @@ do_change_status(R0, Service, clear) ->
 gnow() ->
   calendar:datetime_to_gregorian_seconds(calendar:local_time()).
 
-fault_status(R0, _Service, Type, ResetFun, ResetTimeout, Thresholds) ->
+fault_status(R0, _Service, Type, Opts) ->
+  Thresholds = maps:get(thresholds, Opts, ?THRESHOLDS),
   Now           = gnow(),
   {N, LastNow}  = get_data(R0, Type),
   NThreshold    = n_threshold(Thresholds, Type),
@@ -467,6 +504,8 @@ fault_status(R0, _Service, Type, ResetFun, ResetTimeout, Thresholds) ->
     N + 1 =:= NThreshold,
     Now - LastNow < TimeThreshold        ->
       event(automatically_blocked, R0, [{error, Type}]),
+      ResetTimeout = maps:get(reset_timeout, Opts, ?RESET_TIMEOUT),
+      ResetFun = maps:get(reset_fun, Opts, ?RESET_FUN),
       Flag  = flag(Type),
       R1    = maybe_cancel_timer(R0),
       R2    = set_data(R1, Type, {N + 1, Now}),
